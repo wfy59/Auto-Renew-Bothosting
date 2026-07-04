@@ -208,8 +208,8 @@ def main():
             if value:
                 sb.add_cookie({"name": name, "value": value, "domain": "bot-hosting.net"})
 
-        print("🌐 访问 https://bot-hosting.net/a ...")
-        sb.open("https://bot-hosting.net/a")
+        print("🌐 访问 https://bot-hosting.net/a/billings ...")
+        sb.open("https://bot-hosting.net/a/billings")
         sb.wait_for_ready_state_complete()
         sb.sleep(3)
         current_url = sb.get_current_url()
@@ -221,32 +221,6 @@ def main():
             return
         print(f"✅ 登录成功!")
 
-        print("📝 导航到账单页面...")
-        sb.open("https://bot-hosting.net/a/billings")
-        sb.wait_for_ready_state_complete()
-        print("⏳ 等待页面加载...")
-        sb.sleep(8)
-
-        # 限流重试
-        max_retries = 3
-        retry_count = 0
-        while retry_count <= max_retries:
-            if is_page_blocked(sb):
-                if retry_count < max_retries:
-                    print(f"⏳ 检测到限流，等待 30 秒后重试 ({retry_count+1}/{max_retries})...")
-                    time.sleep(30)
-                    sb.refresh()
-                    sb.wait_for_ready_state_complete()
-                    sb.sleep(8)
-                    retry_count += 1
-                    continue
-                else:
-                    print("❌ 重试后仍触发限流，脚本退出")
-                    send_telegram_message(format_notification("❌ 续期失败", error="IP 被限流 (Error 1015)"))
-                    return
-            else:
-                break
-
         # 提取当前到期日期
         page_source = sb.get_page_source()
         current_expiry = extract_expiry_date(page_source)
@@ -255,7 +229,7 @@ def main():
         else:
             print("⚠️ 未能提取当前到期日期")
 
-        # 先找外部续期按钮
+        # 寻找外部续期按钮
         outer_renew_selector = None
         countdown_text = None
         possible_selectors = [
@@ -277,14 +251,14 @@ def main():
                         break
                     elif "Renew" in button_text and "in" not in button_text.lower():
                         outer_renew_selector = selector
-                        print(f"✅ 期按钮可用: '{button_text}'")
+                        print(f"✅ 续期按钮可用: '{button_text}'")
                         break
             except Exception as e:
                 pass
 
-        # 如果外部按钮存在且可用
+        # 点击外部按钮，处理弹窗中的 Turnstile，再点击内部按钮 
         if outer_renew_selector:
-            print("🔄 点击续期按钮...")
+            print("🔄 点击外部续期按钮，等待验证窗口...")
             try:
                 sb.click(outer_renew_selector)
                 sb.sleep(3)  # 等待模态框加载
@@ -293,13 +267,11 @@ def main():
                 send_telegram_message(format_notification("❌ 续期失败", error="点击外部续期按钮出错"))
                 return
 
-            # 处理弹窗中的 Turnstile 
+            # 处理弹窗中的 Turnstile
             print("🔒 检测弹窗中的 Turnstile 验证...")
             turnstile_passed = False
-            # 因为 Turnstile 可能在 iframe 内，使用 uc_gui_click_captcha 会自动处理
             for attempt in range(1, 4):
                 try:
-                    # 尝试点击 Turnstile（如果已经出现）
                     sb.uc_gui_click_captcha()
                     time.sleep(8)
                 except Exception as e:
@@ -311,38 +283,62 @@ def main():
                     break
                 else:
                     print(f"⏳ 第 {attempt} 次未通过，重试点击...")
-                    # 可尝试重新触发，但直接循环
 
             if not turnstile_passed:
                 print("❌ Turnstile 验证最终未通过，脚本退出")
                 send_telegram_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
                 return
 
-            # 点击弹窗内的续期按钮
-            modal_renew_selectors = [
+            # 等待并点击弹窗内的续期按钮
+            print("⏳ 等待弹窗内续期按钮变为可用...")
+            modal_button_clicked = False
+            # 优先根据文本和状态选择
+            modal_selectors = [
                 'button:contains("Renew for 4 days")',
                 'button:contains("Renew")',
                 'button:contains("续期")',
-                '[class*="renew"]',  # 兜底
+                '[class*="renew"]:not([disabled])',  # 未 disabled 的
+                'button[class*="green"]:not([disabled])',  # 可能的绿色按钮
             ]
-            modal_renew_clicked = False
-            for sel in modal_renew_selectors:
+
+            for sel in modal_selectors:
                 try:
-                    # 等待按钮可见且可点击（可能验证后启用）
+                    # 等待元素可见，然后等待可点击（即 disabled 被移除）
                     if sb.is_element_visible(sel, timeout=5):
+                        sb.wait_for_element_clickable(sel, timeout=10)  # 等待可点击
                         print(f"🔄 点击弹窗内续期按钮: {sel}")
                         sb.click(sel)
-                        modal_renew_clicked = True
+                        modal_button_clicked = True
                         break
                 except Exception as e:
+                    print(f"  尝试选择器 {sel} 失败: {e}")
                     continue
-            if not modal_renew_clicked:
-                print("⚠️ 未找到弹窗内续期按钮，可能已经自动续期或页面结构变化")
-                # 依然继续，尝试刷新获取状态
 
-            #  续期后处理 
+            # 如果以上选择器都未找到，尝试遍历所有按钮
+            if not modal_button_clicked:
+                print("⚠️ 常规选择器未找到，尝试遍历所有 button 并点击包含 'Renew' 且未禁用的...")
+                try:
+                    buttons = sb.find_elements("button")
+                    for btn in buttons:
+                        text = btn.text
+                        if "Renew" in text and not btn.get_attribute("disabled"):
+                            # 确保按钮可见且可点击
+                            if btn.is_enabled() and btn.is_displayed():
+                                sb.click(btn)
+                                modal_button_clicked = True
+                                print("✅ 通过遍历按钮点击成功")
+                                break
+                except Exception as e:
+                    print(f"遍历点击失败: {e}")
+
+            if not modal_button_clicked:
+                print("⚠️ 未找到弹窗内可用的续期按钮，可能已经自动续期或页面结构变化")
+            else:
+                print("✅ 弹窗内续期按钮已点击")
+
+            # 续期后处理
             print("⏳ 等待续期处理完成...")
-            sb.sleep(6)
+            sb.sleep(8)
 
             # 提取新的到期日期和倒计时
             new_page_text = sb.get_page_source()
@@ -361,21 +357,21 @@ def main():
                     )
                 )
             else:
-                # 可能续期成功，但倒计时消失（刚续期完没有倒计时？）
-                if new_expiry:
-                    print(f"✅ 续期成功，到期日期: {new_expiry}")
+                if new_expiry and new_expiry != current_expiry:
+                    print(f"✅ 续期成功，到期日期已更新为: {new_expiry}")
                     send_telegram_message(
                         format_notification(
                             "✅ 续期成功",
-                            extra="请登录后台查看最新状态",
+                            extra="到期日期已更新",
                             expiry_date=new_expiry
                         )
                     )
                 else:
-                    print("⚠️ 续期状态未知，请手动检查")
+                    # 可能续期未成功或没有变化
+                    print("⚠️ 续期结果未知，到期日期未变化，请手动检查")
                     send_telegram_message(
                         format_notification(
-                            "⚠️ 续期结果未知",
+                            "⚠️ 续期可能未成功",
                             extra="请登录后台检查",
                             expiry_date=current_expiry or "（未获取到）"
                         )
